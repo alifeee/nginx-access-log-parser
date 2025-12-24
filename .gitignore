@@ -1,4 +1,5 @@
 # logs
+/logs/
 access.log
 # built files
 access.csv

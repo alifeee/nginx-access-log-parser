@@ -13,6 +13,8 @@ log_format upstream_time '$remote_addr - $remote_user [$time_local] '
     'rt="$request_time" uct="$upstream_connect_time" uht="$upstream_header_time" urt="$upstream_response_time"';
 usage:
   python3 parse.py /var/log/nginx/access.log
+usage (multiple log files):
+  ls /var/log/nginx/access.log* | sort -rV | xargs python3 parse.py
 """
 
 import sys
@@ -20,25 +22,19 @@ import csv
 import hashlib
 import json
 import datetime
+import gzip
 
 if len(sys.argv) < 2:
     raise ValueError(
-        "need to include file, e.g.,: python3 parse.py /var/log/nginx/access.log"
+        "need to include file(s), e.g.,: python3 parse.py /var/log/nginx/access.log.1 /var/log/nginx/access.log"
     )
-access_log = sys.argv[1]
-with open("http_codes.json", "r", encoding="utf-8") as file:
-    http_codes = json.load(file)
-
-print(f"parsing {access_log}...")
-
-with open(access_log, "r", encoding="utf-8") as file:
-    reader = csv.reader(file, delimiter=" ")
-    logs = list(reader)
+access_logs = sys.argv[1:]
+N_LOG_FILES = len(access_logs)
 
 NGINX_DATE_FORMAT = "[%d/%b/%Y:%H:%M:%S %z]"
 GOOD_RESPONSE_CODES = ["200", "304", "206"]
 IGNORE_RESPONSE_CODES = ["301", "101"]
-
+# log locations of items
 i_IP = 0
 i_TIMEPT1 = 3
 i_TIMEPT2 = 4
@@ -48,41 +44,66 @@ i_BYTES = 7
 i_REFERER = 8
 i_USERAGENT = 9
 i_DOMAIN = 10
+with open("http_codes.json", "r", encoding="utf-8") as file:
+    http_codes = json.load(file)
 
 parsed = []
-for log in logs:
-    # hash IP+useragent to make "user"
-    ipandua = f"{log[i_IP]}+{log[i_USERAGENT]}"
-    userhash = hashlib.md5(ipandua.encode("utf-8")).hexdigest()[:10]
+last_dt = 0
+for access_log in access_logs:
+    print(f"parsing {access_log}...")
 
-    # get request type and location
-    request = log[i_REQUEST]
-    try:
-        request_method, request_path, request_version = request.split(" ")
-    except ValueError:
-        continue
+    if access_log.endswith(".gz"):
+        # open gzip file
+        with gzip.open(access_log, "rt", encoding="utf-8") as file:
+            reader = csv.reader(file, delimiter=" ")
+            logs = list(reader)
+    else:
+        # open normal file
+        with open(access_log, "r", encoding="utf-8") as file:
+            reader = csv.reader(file, delimiter=" ")
+            logs = list(reader)
 
-    # get time as unix timestamp
-    #   (we ignore timept2, assume UTC)
-    dt = datetime.datetime.strptime(
-        f"{log[i_TIMEPT1]} {log[i_TIMEPT2]}", NGINX_DATE_FORMAT
-    )
+    for j, log in enumerate(logs):
+        # hash IP+useragent to make "user"
+        ipandua = f"{log[i_IP]}+{log[i_USERAGENT]}"
+        userhash = hashlib.md5(ipandua.encode("utf-8")).hexdigest()[:16]
 
-    # line of parsed
-    parsed.append(
-        {
-            "userhash": userhash,
-            "ip": log[i_IP],
-            "datetime": dt.timestamp(),
-            "useragent": log[i_USERAGENT],
-            "domain": log[i_DOMAIN],
-            "request_method": request_method,
-            "request_path": request_path,
-            "referer": log[i_REFERER],
-            "response": log[i_RESPONSE],
-            "bytes": log[i_BYTES],
-        }
-    )
+        # get request type and location
+        request = log[i_REQUEST]
+        try:
+            request_method, request_path, request_version = request.split(" ")
+        except ValueError:
+            continue
+
+        # get time as unix timestamp
+        #   (we ignore timept2, assume UTC)
+        dt = datetime.datetime.strptime(
+            f"{log[i_TIMEPT1]} {log[i_TIMEPT2]}", NGINX_DATE_FORMAT
+        )
+        # check this log file is newer than the last one
+        ts = dt.timestamp()
+        if j == 1:
+            if ts < last_dt:
+                raise ValueError(
+                    "log files do not seem to be in date order. oldest should be first"
+                )
+            last_dt = ts
+
+        # line of parsed
+        parsed.append(
+            {
+                "userhash": userhash,
+                "ip": log[i_IP],
+                "datetime": ts,
+                "useragent": log[i_USERAGENT],
+                "domain": log[i_DOMAIN],
+                "request_method": request_method,
+                "request_path": request_path,
+                "referer": log[i_REFERER],
+                "response": log[i_RESPONSE],
+                "bytes": log[i_BYTES],
+            }
+        )
 
 print("  saving to access.csv")
 with open("access.csv", "w", encoding="utf-8") as file:
@@ -211,9 +232,19 @@ for u in users:
     if time_diff > 120:
         time_diff = round(time_diff / 60)
         time_diff_unit = "hr"
-    HTML += f" · {time_start.strftime('%Y-%m-%d %H:%M:%S')}"
+    HTML += f" · "
+    time_diff_str = f"({time_diff} {time_diff_unit})"
+    HTML += f"{time_diff_str:<10}"
+    HTML += f" {time_start.strftime('%Y-%m-%d %H:%M:%S')}"
     if time_diff > 0:
-        HTML += f"-{time_end.strftime('%H:%M:%S')} ({time_diff} {time_diff_unit})"
+        if (
+            (time_start.year == time_end.year)
+            and (time_start.month == time_end.month)
+            and (time_start.day == time_end.day)
+        ):
+            HTML += f" - {time_end.strftime('%H:%M:%S')}"
+        else:
+            HTML += f" - {time_end.strftime('%Y-%m-%d %H:%M:%S')}"
     HTML += "</summary>"
     HTML += (
         f"<div class=ua><span class=ip tabindex=0>{u['ip']}</span>"
@@ -239,7 +270,7 @@ for u in users:
             total_good = 1
         HTML += f"<progress min=0 max={total_req - total_ignore} value={total_good}></progress> "
         HTML += f"{d}"
-        HTML += f" ·&nbsp;{u['domains'][d]['total_requests']:>4} total "
+        HTML += f" ·&nbsp;{u['domains'][d]['total_requests']:>5} total "
         HTML += f"&nbsp;{u['domains'][d]['total_bytes']/1024:>8.2f} kB"
         HTML += "</summary>"
 
