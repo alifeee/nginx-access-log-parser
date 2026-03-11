@@ -1,3 +1,5 @@
+> [!CAUTION]
+> MOVED! see <https://git.alifeee.net/nginx-access-log-parser/about/>
 # Nginx log parser
 
 Parses Nginx logs, particularly useful if multiple domains are served from one Nginx instance.
